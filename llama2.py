@@ -6,42 +6,39 @@ import random
 import math
 import struct
 from typing import List
+from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
+import numba
 
 
+@dataclass
 class Config:
-    dim: int
-    hidden_dim: int
-    n_layers: int
-    n_heads: int
-    n_kv_heads: int
-    vocab_size: int
-    seq_len: int
-
-    def __init__(self, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len):
-        self.dim = dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
+    dim: int        # vocabulary vector dim,    D
+    hidden_dim: int # attention dim             H
+    n_layers: int   # decoder layers            N
+    n_heads: int    # query heads               n_heads
+    n_kv_heads: int # key/value heads           n_kv_heads
+    vocab_size: int # vocabulary table size     v
+    seq_len: int    # sequence length           S
 
 
 class TransformerWeights:
-    token_embedding_table: List[float]
-    rms_att_weight: List[float]
-    wq: List[float]
-    wk: List[float]
-    wv: List[float]
-    wo: List[float]
-    rms_ffn_weight: List[float]
-    w1: List[float]
-    w3: List[float]
-    w2: List[float]
-    rms_final_weight: List[float]
-    freq_cis_real: List[float]
-    freq_cis_imag: List[float]
-    wcls: List[float]
+    token_embedding_table: npt.NDArray  # (vocab_size, hidden_dim)
+    rms_att_weight: npt.NDArray
+    wq: npt.NDArray
+    wk: npt.NDArray
+    wv: npt.NDArray
+    wo: npt.NDArray
+    rms_ffn_weight: npt.NDArray
+    w1: npt.NDArray
+    w3: npt.NDArray
+    w2: npt.NDArray
+    rms_final_weight: npt.NDArray
+    freq_cis_real: npt.NDArray
+    freq_cis_imag: npt.NDArray
+    wcls: npt.NDArray
 
 # ----------------------------------------------------------------------------
 # initialization: read from checkpoint
@@ -52,7 +49,7 @@ def checkpoint_init_weights(weights: TransformerWeights,
                             shared_weights: int) -> None:
     def read_floats(count):
         values = struct.unpack(str(count) + 'f', file.read(count * 4 if count > 0 else count))
-        return values
+        return np.array(values)
 
     weights.token_embedding_table = read_floats(conf.vocab_size * conf.dim)
     weights.rms_att_weight = read_floats(conf.n_layers * conf.dim)
@@ -93,59 +90,45 @@ def accum(a, b):
 def rmsnorm(out, x, weight):
     size = len(x)
     # calculate sum of squares
-    ss = 0.0
-    for j in range(size):
-        ss += x[j] * x[j]
-    ss /= size
-    ss += 1e-5
+    ss = np.sum(x * x) / size + 1e-5
     ss = 1.0 / math.sqrt(ss)
     # normalize and scale
-    for j in range(size):
-        out[j] = weight[j] * (ss * x[j])
+    out = weight * (ss * x)
     return out
 
 
-def softmax(x, size):
+def softmax(x: npt.NDArray):
     # find max value (for numerical stability)
-    max_val = x[0]
-    for i in range(1, size):
-        if x[i] > max_val:
-            max_val = x[i]
+    max_val = np.max(x)
     # exp and sum
-    exp_sum = 0.0
-    for i in range(size):
-        x[i] = math.exp(x[i] - max_val)
-        exp_sum += x[i]
+    x = np.exp(x - max_val)
+    exp_sum = np.sum(x)
     # normalize
-    for i in range(size):
-        x[i] /= exp_sum
+    x = x / exp_sum
     return x
 
 
 def matmul(xout, x, w, n, d):
     # W (d,n) @ x (n,) -> xout (d,)
     # by far the most amount of time is spent inside this little function
-    for i in range(d):
-        val = 0.0
-        for j in range(n):
-            val += w[i * n + j] * x[j]
-        xout[i] = val
+    w = w.reshape(d, n)
+    xout = np.matmul(w, x)
     return xout
 
 
 class RunState:
-    x: List[float]
-    xb: List[float]
-    q: List[float]
-    k: List[float]
-    v: List[float]
-    att: List[float]
-    key_cache: List[float]
-    value_cache: List[float]
-    xb2: List[float]
-    hb: List[float]
-    hb2: List[float]
-    logits: List[float]
+    x: npt.NDArray
+    xb: npt.NDArray
+    q: npt.NDArray
+    k: npt.NDArray
+    v: npt.NDArray
+    att: npt.NDArray
+    key_cache: npt.NDArray
+    value_cache: npt.NDArray
+    xb2: npt.NDArray
+    hb: npt.NDArray
+    hb2: npt.NDArray
+    logits: npt.NDArray
 
 
 # token, pos, config, state, weights
@@ -223,7 +206,7 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
                 att[t] = score
 
             # Softmax the scores to get attention weights, from 0..pos inclusively
-            att = softmax(att, pos + 1)
+            att = softmax(att[:pos + 1])
 
             xb_ptr = h * head_size
             # Weighted sum of the values, store back into xb
@@ -358,19 +341,19 @@ def argmax(v):
     return max_i
 
 
-def init_run_state(state, config):
-    state.x = [0.0] * config.dim
-    state.xb = [0.0] * config.dim
-    state.xb2 = [0.0] * config.dim
-    state.hb = [0.0] * config.hidden_dim
-    state.hb2 = [0.0] * config.hidden_dim
-    state.q = [0.0] * config.dim
-    state.k = [0.0] * config.dim
-    state.v = [0.0] * config.dim
-    state.att = [0.0] * (config.n_heads * config.seq_len)
-    state.logits = [0.0] * config.vocab_size
-    state.key_cache = [0.0] * (config.n_layers * config.seq_len * config.dim)
-    state.value_cache = [0.0] * (config.n_layers * config.seq_len * config.dim)
+def init_run_state(state, config: Config):
+    state.x = np.zeros((config.dim,), dtype=np.float32)
+    state.xb = np.zeros((config.dim,), dtype=np.float32)
+    state.xb2 = np.zeros((config.dim,), dtype=np.float32)
+    state.hb = np.zeros((config.hidden_dim,), dtype=np.float32)
+    state.hb2 = np.zeros((config.hidden_dim,), dtype=np.float32)
+    state.q = np.zeros((config.dim,), dtype=np.float32)
+    state.k = np.zeros((config.dim,), dtype=np.float32)
+    state.v = np.zeros((config.dim,), dtype=np.float32)
+    state.att = np.zeros((config.n_heads * config.seq_len,), dtype=np.float32)
+    state.logits = np.zeros((config.vocab_size,), dtype=np.float32)
+    state.key_cache = np.zeros((config.n_layers * config.seq_len * config.dim,), dtype=np.float32)
+    state.value_cache = np.zeros((config.n_layers * config.seq_len * config.dim,), dtype=np.float32)
 
 
 def run(args):
@@ -441,7 +424,7 @@ def run(args):
                 # Apply the temperature to the logits
                 state.logits = [i / temperature for i in state.logits]
                 # Apply softmax to the logits to get the probabilities for the next token
-                softmax(state.logits, config.vocab_size)
+                softmax(state.logits[:config.vocab_size])
                 # Sample from this distribution to get the next token
                 next_token = sample(state.logits)
 
@@ -472,10 +455,10 @@ def run(args):
 
 if __name__ == "__main__":
     args = {
-        "checkpoint": './out/stories15M.bin',
+        "checkpoint": './stories15M.bin',
         "temperature": "0.0",
-        "steps": "256",
-        "prompt": None
+        "steps": "10",
+        "prompt": "Dream comes true this day"
     }
     # if len(sys.argv) < 2:
     #     print(
